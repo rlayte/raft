@@ -44,7 +44,6 @@ type Server struct {
 }
 
 func (s *Server) startElection() {
-	log.Println("Starting election again", s.Id, s.Role)
 	s.Role = Candidate
 	s.Term = 1
 
@@ -60,10 +59,16 @@ func (s *Server) startElection() {
 		}
 	}
 
-	log.Println("Votes", votes, s.ClusterSize/2)
 	if votes > s.ClusterSize/2 {
-		log.Println("Found leader", s.Id)
 		s.Role = Leader
+	}
+}
+
+func (s *Server) updateFollowers() {
+	for _, server := range s.Cluster {
+		args := AppendEntriesArgs{s.Term, s.Id}
+		reply := AppendEntriesReply{}
+		call(server.host(), "Server.AppendEntries", &args, &reply)
 	}
 }
 
@@ -76,6 +81,10 @@ func (s *Server) leaderDead() bool {
 }
 
 func (s *Server) heartbeat() {
+	if s.Role == Leader {
+		s.updateFollowers()
+	}
+
 	if s.leaderDead() && s.Role == Follower {
 		s.startElection()
 	}
@@ -139,6 +148,32 @@ func (s *Server) RequestVote(args *VoteArgs, reply *VoteReply) error {
 			reply.Granted = true
 			reply.Term = s.Term
 		}
+	}
+
+	return nil
+}
+
+type AppendEntriesArgs struct {
+	Term int
+	Id   string
+}
+
+type AppendEntriesReply struct {
+	Term    int
+	Success bool
+}
+
+func (s *Server) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) error {
+	if args.Term < s.Term {
+		reply.Term = s.Term
+		reply.Success = false
+	} else {
+		s.Term = args.Term
+		s.Role = Follower
+		s.LastContact = time.Now()
+
+		reply.Term = s.Term
+		reply.Success = true
 	}
 
 	return nil
