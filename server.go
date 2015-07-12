@@ -32,6 +32,11 @@ func call(srv string, rpcname string, args interface{}, reply interface{}) bool 
 	return err == nil
 }
 
+type Vote struct {
+	Id   string
+	Time time.Time
+}
+
 type Server struct {
 	Id              string
 	Role            ServerState
@@ -39,7 +44,7 @@ type Server struct {
 	LastContact     time.Time
 	Cluster         []Server
 	ClusterSize     int
-	VotedFor        string
+	VotedFor        *Vote
 	ElectionTimeout time.Duration
 }
 
@@ -80,12 +85,20 @@ func (s *Server) leaderDead() bool {
 	return time.Since(s.LastContact) > s.ElectionTimeout*time.Millisecond
 }
 
+func (s *Server) voteInvalid() bool {
+	return s.VotedFor == nil || time.Since(s.VotedFor.Time) > s.ElectionTimeout*time.Millisecond
+}
+
+func (s *Server) validCandidate() bool {
+	return s.Role == Follower && s.leaderDead() && s.voteInvalid()
+}
+
 func (s *Server) heartbeat() {
 	if s.Role == Leader {
 		s.updateFollowers()
 	}
 
-	if s.leaderDead() && s.Role == Follower {
+	if s.validCandidate() {
 		s.startElection()
 	}
 }
@@ -143,8 +156,8 @@ func (s *Server) RequestVote(args *VoteArgs, reply *VoteReply) error {
 	} else {
 		s.Term = args.Term
 
-		if s.VotedFor == "" || s.VotedFor == args.Id {
-			s.VotedFor = args.Id
+		if s.VotedFor == nil || s.VotedFor.Id == args.Id {
+			s.VotedFor = &Vote{args.Id, time.Now()}
 			reply.Granted = true
 			reply.Term = s.Term
 		}
@@ -170,6 +183,7 @@ func (s *Server) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesRepl
 	} else {
 		s.Term = args.Term
 		s.Role = Follower
+		s.VotedFor = nil
 		s.LastContact = time.Now()
 
 		reply.Term = s.Term
