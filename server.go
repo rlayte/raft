@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/rpc"
 	"os"
+	"sync"
 	"time"
 )
 
@@ -39,20 +40,25 @@ type Vote struct {
 
 type Server struct {
 	Id              string
+	ClusterId       string
 	Role            ServerState
 	Term            int
+	Log             []Command
 	LastContact     time.Time
 	Cluster         []Server
 	ClusterSize     int
 	VotedFor        *Vote
 	ElectionTimeout time.Duration
+	voting          *sync.Mutex
+	dead            bool
 }
 
 func (s *Server) startElection() {
 	s.Role = Candidate
 	s.Term = 1
+	s.VotedFor = &Vote{s.Id, time.Now()}
 
-	votes := 0
+	votes := 1
 
 	for _, server := range s.Cluster {
 		args := VoteArgs{s.Term, s.Id}
@@ -78,7 +84,7 @@ func (s *Server) updateFollowers() {
 }
 
 func (s *Server) host() string {
-	return "/var/tmp/raft-" + s.Id
+	return fmt.Sprintf("/var/tmp/raft-%s-%s", s.ClusterId, s.Id)
 }
 
 func (s *Server) leaderDead() bool {
@@ -104,7 +110,7 @@ func (s *Server) heartbeat() {
 }
 
 func (s *Server) startHeartbeat() {
-	for {
+	for !s.dead {
 		s.heartbeat()
 		time.Sleep(time.Millisecond * time.Duration(HeartbeatInterval))
 	}
@@ -131,10 +137,14 @@ func (s *Server) startRPC() {
 	}
 }
 
+func (s *Server) kill() {
+	s.dead = true
+}
+
 func (s *Server) configureCluster() {
 	for i := 0; i < s.ClusterSize; i++ {
 		if id := fmt.Sprintf("%d", i); id != s.Id {
-			s.Cluster = append(s.Cluster, Server{Id: id})
+			s.Cluster = append(s.Cluster, Server{Id: id, ClusterId: s.ClusterId})
 		}
 	}
 }
@@ -154,13 +164,15 @@ func (s *Server) RequestVote(args *VoteArgs, reply *VoteReply) error {
 		reply.Term = s.Term
 		reply.Granted = false
 	} else {
-		s.Term = args.Term
-
+		s.voting.Lock()
 		if s.VotedFor == nil || s.VotedFor.Id == args.Id {
+			s.Term = args.Term
 			s.VotedFor = &Vote{args.Id, time.Now()}
 			reply.Granted = true
 			reply.Term = s.Term
+
 		}
+		s.voting.Unlock()
 	}
 
 	return nil
@@ -183,7 +195,6 @@ func (s *Server) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesRepl
 	} else {
 		s.Term = args.Term
 		s.Role = Follower
-		s.VotedFor = nil
 		s.LastContact = time.Now()
 
 		reply.Term = s.Term
@@ -193,14 +204,33 @@ func (s *Server) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesRepl
 	return nil
 }
 
-func NewServer(id string, clusterSize int) (s *Server) {
+type Command struct {
+}
+
+type ExecuteCommandArgs struct {
+	Command Command
+}
+
+type ExecuteCommandReply struct {
+	Success bool
+}
+
+func (s *Server) Execute(args *ExecuteCommandArgs, reply *ExecuteCommandReply) error {
+	s.Log = append(s.Log, args.Command)
+	return nil
+}
+
+func NewServer(id string, clusterId string, clusterSize int) (s *Server) {
 	s = &Server{
 		Id:          id,
+		ClusterId:   clusterId,
 		Role:        Follower,
 		Term:        0,
+		Log:         []Command{},
 		Cluster:     []Server{},
 		LastContact: time.Now(),
 		ClusterSize: clusterSize,
+		voting:      &sync.Mutex{},
 	}
 
 	s.ElectionTimeout = time.Duration(ElectionTimeout + rand.Intn(ElectionTimeout))

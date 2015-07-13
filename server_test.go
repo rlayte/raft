@@ -6,26 +6,45 @@ import (
 	"time"
 )
 
-func TestNewServer(t *testing.T) {
-	s := NewServer("0", 1)
+func createCluster(name string, n int) []*Server {
+	cluster := []*Server{}
 
-	if s.Role != Follower {
-		t.Error("Servers should start as followers")
+	for i := 0; i < n; i++ {
+		id := fmt.Sprintf("%d", i)
+		cluster = append(cluster, NewServer(id, name, n))
 	}
 
-	if s.Term != 0 {
-		t.Error("Servers should start at term 0")
+	return cluster
+}
+
+func destroyCluster(cluster []*Server) {
+	for _, server := range cluster {
+		server.kill()
+	}
+}
+
+func TestNewServer(t *testing.T) {
+	cluster := createCluster("basic", 1)
+	defer destroyCluster(cluster)
+
+	for index, server := range cluster {
+		if server.Role != Follower {
+			t.Error("Servers should start as followers")
+		}
+
+		if server.Term != 0 {
+			t.Error("Servers should start at term 0")
+		}
+
+		if server.host() != fmt.Sprintf("/var/tmp/raft-basic-%d", index) {
+			t.Error("Servers should set the correct host")
+		}
 	}
 }
 
 func TestFirstElection(t *testing.T) {
-	var cluster [5]*Server
-	n := len(cluster)
-
-	for i := 0; i < n; i++ {
-		id := fmt.Sprintf("%d", i)
-		cluster[i] = NewServer(id, n)
-	}
+	cluster := createCluster("election", 5)
+	defer destroyCluster(cluster)
 
 	time.Sleep(time.Second)
 
@@ -48,5 +67,30 @@ func TestFirstElection(t *testing.T) {
 
 	if followers != 4 {
 		t.Error("There should be 4 followers", followers)
+	}
+}
+
+func TestAppendEntries(t *testing.T) {
+	var primary *Server
+	cluster := createCluster("append", 5)
+	defer destroyCluster(cluster)
+
+	time.Sleep(time.Second)
+
+	for _, server := range cluster {
+		if server.Role == Leader {
+			primary = server
+			break
+		}
+	}
+
+	command := Command{}
+	client := Client{primary.host()}
+	client.Execute(command)
+
+	time.Sleep(time.Second)
+
+	if primary.Log[0] != command {
+		t.Error("First command should be appended")
 	}
 }
