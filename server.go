@@ -18,9 +18,12 @@ const (
 
 	HeartbeatInterval int = 10
 	ElectionTimeout   int = 150
+
+	WrongServerError RaftError = "WrongServerError"
 )
 
 type ServerState string
+type RaftError string
 
 func call(srv string, rpcname string, args interface{}, reply interface{}) bool {
 	c, errx := rpc.Dial("unix", srv)
@@ -33,17 +36,26 @@ func call(srv string, rpcname string, args interface{}, reply interface{}) bool 
 	return err == nil
 }
 
+type Command struct {
+}
+
 type Vote struct {
 	Id   string
 	Time time.Time
+}
+
+type LogEntry struct {
+	Term    int
+	Command Command
 }
 
 type Server struct {
 	Id              string
 	ClusterId       string
 	Role            ServerState
+	Leader          string
 	Term            int
-	Log             []Command
+	Log             []LogEntry
 	LastContact     time.Time
 	Cluster         []Server
 	ClusterSize     int
@@ -75,9 +87,9 @@ func (s *Server) startElection() {
 	}
 }
 
-func (s *Server) updateFollowers() {
+func (s *Server) updateFollowers(entries []LogEntry) {
 	for _, server := range s.Cluster {
-		args := AppendEntriesArgs{s.Term, s.Id}
+		args := AppendEntriesArgs{s.Term, s.host(), entries}
 		reply := AppendEntriesReply{}
 		call(server.host(), "Server.AppendEntries", &args, &reply)
 	}
@@ -101,7 +113,7 @@ func (s *Server) validCandidate() bool {
 
 func (s *Server) heartbeat() {
 	if s.Role == Leader {
-		s.updateFollowers()
+		s.updateFollowers([]LogEntry{})
 	}
 
 	if s.validCandidate() {
@@ -179,8 +191,9 @@ func (s *Server) RequestVote(args *VoteArgs, reply *VoteReply) error {
 }
 
 type AppendEntriesArgs struct {
-	Term int
-	Id   string
+	Term    int
+	Id      string
+	Entries []LogEntry
 }
 
 type AppendEntriesReply struct {
@@ -194,8 +207,10 @@ func (s *Server) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesRepl
 		reply.Success = false
 	} else {
 		s.Term = args.Term
+		s.Leader = args.Id
 		s.Role = Follower
 		s.LastContact = time.Now()
+		s.Log = append(s.Log, args.Entries...)
 
 		reply.Term = s.Term
 		reply.Success = true
@@ -204,19 +219,28 @@ func (s *Server) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesRepl
 	return nil
 }
 
-type Command struct {
-}
-
 type ExecuteCommandArgs struct {
 	Command Command
 }
 
 type ExecuteCommandReply struct {
 	Success bool
+	Error   RaftError
+	Leader  string
 }
 
 func (s *Server) Execute(args *ExecuteCommandArgs, reply *ExecuteCommandReply) error {
-	s.Log = append(s.Log, args.Command)
+	if s.Role != Leader {
+		reply.Error = WrongServerError
+		reply.Success = false
+		reply.Leader = s.Leader
+		return nil
+	}
+
+	entry := LogEntry{s.Term, args.Command}
+	s.Log = append(s.Log, entry)
+	s.updateFollowers([]LogEntry{entry})
+
 	return nil
 }
 
@@ -226,7 +250,7 @@ func NewServer(id string, clusterId string, clusterSize int) (s *Server) {
 		ClusterId:   clusterId,
 		Role:        Follower,
 		Term:        0,
-		Log:         []Command{},
+		Log:         []LogEntry{},
 		Cluster:     []Server{},
 		LastContact: time.Now(),
 		ClusterSize: clusterSize,

@@ -71,26 +71,31 @@ func TestFirstElection(t *testing.T) {
 }
 
 func TestAppendEntries(t *testing.T) {
-	var primary *Server
 	cluster := createCluster("append", 5)
 	defer destroyCluster(cluster)
 
 	time.Sleep(time.Second)
 
-	for _, server := range cluster {
-		if server.Role == Leader {
-			primary = server
-			break
-		}
-	}
-
 	command := Command{}
-	client := Client{primary.host()}
+	client := Client{cluster[0].host()}
 	client.Execute(command)
 
 	time.Sleep(time.Second)
 
-	if primary.Log[0] != command {
-		t.Error("First command should be appended")
+	for _, server := range cluster {
+		if len(server.Log) == 0 {
+			t.Error("No commands appended to log")
+			continue
+		}
+
+		firstEntry := server.Log[0]
+
+		if firstEntry.Term != server.Term {
+			t.Error("Entry should share the same term as primary")
+		}
+
+		if firstEntry.Command != command {
+			t.Error("First command should be appended")
+		}
 	}
 }
