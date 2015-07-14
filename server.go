@@ -19,7 +19,9 @@ const (
 	HeartbeatInterval int = 10
 	ElectionTimeout   int = 150
 
-	WrongServerError RaftError = "WrongServerError"
+	WrongServerError     RaftError = "WrongServerError"
+	LogInconsistentError RaftError = "LogInconsistentError"
+	TermOutdatedError    RaftError = "TermOutdatedError"
 )
 
 type ServerState string
@@ -67,11 +69,23 @@ type Server struct {
 	CommitIndex     int
 	Cluster         []Server
 	ClusterSize     int
+	NextIndex       map[string]int
+	MatchIndex      map[string]int
 	VotedFor        *Vote
 	ElectionTimeout time.Duration
 	Commit          CommitFunc
 	voting          *sync.Mutex
 	dead            bool
+}
+
+func (s *Server) becomeLeader() {
+	s.Role = Leader
+
+	for _, node := range s.Cluster {
+		lastEntry := s.Log[len(s.Log)-1]
+		s.NextIndex[node.host()] = lastEntry.Index + 1
+		s.MatchIndex[node.host()] = 0
+	}
 }
 
 func (s *Server) startElection() {
@@ -92,21 +106,36 @@ func (s *Server) startElection() {
 	}
 
 	if votes > s.ClusterSize/2 {
-		s.Role = Leader
+		s.becomeLeader()
 	}
 }
 
-func (s *Server) updateFollowers(entries []LogEntry) bool {
+func (s *Server) callAppendEntries(server Server, entries []LogEntry, prevEntry LogEntry) (bool, AppendEntriesReply) {
+	args := AppendEntriesArgs{s.Term, s.host(), entries, s.CommitIndex, prevEntry.Index, prevEntry.Term}
+	reply := AppendEntriesReply{}
+	ok := call(server.host(), "Server.AppendEntries", &args, &reply)
+	return ok, reply
+}
+
+func (s *Server) updateFollowers() bool {
 	var failures int
 
 	for _, server := range s.Cluster {
-		lastEntry := s.Log[len(s.Log)-1]
-		args := AppendEntriesArgs{s.Term, s.host(), entries, s.CommitIndex, lastEntry.Index, lastEntry.Term}
-		reply := AppendEntriesReply{}
-		ok := call(server.host(), "Server.AppendEntries", &args, &reply)
+		prevEntry := s.Log[s.NextIndex[server.host()]]
+		entries := s.Log[s.NextIndex[server.host()]:]
+		ok, reply := s.callAppendEntries(server, entries, prevEntry)
+
+		for reply.Error == LogInconsistentError {
+			s.NextIndex[server.host()] -= 1
+			entries = s.Log[s.NextIndex[server.host()]:]
+			ok, reply = s.callAppendEntries(server, entries, prevEntry)
+		}
 
 		if !ok || !reply.Success {
 			failures++
+		} else {
+			lastEntry := s.Log[len(s.Log)-1]
+			s.NextIndex[server.host()] = lastEntry.Index + 1
 		}
 	}
 
@@ -131,7 +160,10 @@ func (s *Server) validCandidate() bool {
 
 func (s *Server) heartbeat() {
 	if s.Role == Leader {
-		s.updateFollowers([]LogEntry{})
+		for _, server := range s.Cluster {
+			lastEntry := s.Log[len(s.Log)-1]
+			s.callAppendEntries(server, []LogEntry{}, lastEntry)
+		}
 	}
 
 	for s.LastApplied < s.CommitIndex {
@@ -176,6 +208,17 @@ func (s *Server) startRPC() {
 	}
 }
 
+func (s *Server) updateCommitIndex(leaderCommit int) {
+	if leaderCommit > s.CommitIndex {
+		lastEntry := s.Log[len(s.Log)-1]
+		if leaderCommit < lastEntry.Index {
+			s.CommitIndex = leaderCommit
+		} else {
+			s.CommitIndex = lastEntry.Index
+		}
+	}
+}
+
 func (s *Server) kill() {
 	s.dead = true
 }
@@ -183,7 +226,10 @@ func (s *Server) kill() {
 func (s *Server) configureCluster() {
 	for i := 0; i < s.ClusterSize; i++ {
 		if id := fmt.Sprintf("%d", i); id != s.Id {
-			s.Cluster = append(s.Cluster, Server{Id: id, ClusterId: s.ClusterId})
+			node := Server{Id: id, ClusterId: s.ClusterId}
+			s.Cluster = append(s.Cluster, node)
+			s.NextIndex[node.host()] = 0
+			s.MatchIndex[node.host()] = 0
 		}
 	}
 }
@@ -229,27 +275,38 @@ type AppendEntriesArgs struct {
 type AppendEntriesReply struct {
 	Term    int
 	Success bool
+	Error   RaftError
+}
+
+func (s *Server) logInconsistent(index int, term int) bool {
+	if index >= len(s.Log) {
+		return false
+	}
+
+	return s.Log[index].Term != term
 }
 
 func (s *Server) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) error {
 	if args.Term < s.Term {
 		reply.Term = s.Term
 		reply.Success = false
+		reply.Error = TermOutdatedError
+	} else if s.logInconsistent(args.PrevLogIndex, args.PrevLogTerm) {
+		log.Println("Mismatch index/term")
+		reply.Success = false
+		reply.Error = LogInconsistentError
 	} else {
 		s.Term = args.Term
 		s.Leader = args.Id
 		s.Role = Follower
 		s.LastContact = time.Now()
-		s.Log = append(s.Log, args.Entries...)
 
-		if args.LeaderCommit > s.CommitIndex {
-			lastEntry := s.Log[len(s.Log)-1]
-			if args.LeaderCommit < lastEntry.Index {
-				s.CommitIndex = args.LeaderCommit
-			} else {
-				s.CommitIndex = lastEntry.Index
-			}
+		if args.PrevLogIndex < len(s.Log) {
+			s.Log = s.Log[:args.PrevLogIndex+1]
 		}
+
+		s.Log = append(s.Log, args.Entries...)
+		s.updateCommitIndex(args.LeaderCommit)
 
 		reply.Term = s.Term
 		reply.Success = true
@@ -279,7 +336,7 @@ func (s *Server) Execute(args *ExecuteCommandArgs, reply *ExecuteCommandReply) e
 
 	entry := LogEntry{len(s.Log), s.Term, args.Command}
 	s.Log = append(s.Log, entry)
-	safe := s.updateFollowers([]LogEntry{entry})
+	safe := s.updateFollowers()
 
 	if safe {
 		reply.Update = s.Commit(entry.Command)
@@ -298,6 +355,8 @@ func NewServer(id string, clusterId string, clusterSize int) (s *Server) {
 		Term:        0,
 		Log:         []LogEntry{LogEntry{}},
 		Cluster:     []Server{},
+		NextIndex:   map[string]int{},
+		MatchIndex:  map[string]int{},
 		LastContact: time.Now(),
 		ClusterSize: clusterSize,
 		voting:      &sync.Mutex{},

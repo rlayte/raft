@@ -134,7 +134,7 @@ func checkStateMachine(t *testing.T, client *Client, cluster []*KVStore, cases m
 }
 
 func TestStateReplication(t *testing.T) {
-	cluster := createCluster("append", 5)
+	cluster := createCluster("replication", 5)
 	defer destroyCluster(cluster)
 
 	time.Sleep(time.Duration(ElectionTimeout*2) * time.Millisecond)
