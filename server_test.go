@@ -118,28 +118,40 @@ func TestLogReplication(t *testing.T) {
 	}
 }
 
+func checkStateMachine(t *testing.T, client *Client, cluster []*KVStore, cases map[string]string) {
+	for k, v := range cases {
+		command := Command{"PUT", k, v}
+		client.Execute(command)
+
+		time.Sleep(time.Duration(HeartbeatInterval*3) * time.Millisecond)
+
+		for _, server := range cluster {
+			if server.data[k] != v {
+				t.Error(k, "should equal", v, "not", server.data[k], server.data)
+			}
+		}
+	}
+}
+
 func TestStateReplication(t *testing.T) {
 	cluster := createCluster("append", 5)
 	defer destroyCluster(cluster)
 
 	time.Sleep(time.Duration(ElectionTimeout*2) * time.Millisecond)
 
-	cases := map[string]string{
-		"Foo": "Bar",
-	}
-
 	client := Client{cluster[0].host()}
 
-	for k, v := range cases {
-		command := Command{"PUT", k, v}
-		client.Execute(command)
-
-		time.Sleep(time.Duration(HeartbeatInterval*2) * time.Millisecond)
-
-		for _, server := range cluster {
-			if server.data[k] != v {
-				t.Error(k, "should equal", v, server.data)
-			}
-		}
+	cases := map[string]string{
+		"Foo": "Bar",
+		"Bar": "Foo",
 	}
+
+	checkStateMachine(t, &client, cluster, cases)
+
+	updates := map[string]string{
+		"Foo": "Baz",
+		"Bar": "Baz",
+	}
+
+	checkStateMachine(t, &client, cluster, updates)
 }
