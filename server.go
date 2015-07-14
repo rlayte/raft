@@ -94,9 +94,10 @@ func (s *Server) startElection() {
 	s.VotedFor = &Vote{s.Id, time.Now()}
 
 	votes := 1
+	lastEntry := s.Log[len(s.Log)-1]
 
 	for _, server := range s.Cluster {
-		args := VoteArgs{s.Term, s.Id}
+		args := VoteArgs{s.Term, s.Id, lastEntry.Index, lastEntry.Term}
 		reply := VoteReply{}
 		call(server.host(), "Server.RequestVote", &args, &reply)
 
@@ -235,13 +236,24 @@ func (s *Server) configureCluster() {
 }
 
 type VoteArgs struct {
-	Term int
-	Id   string
+	Term         int
+	Id           string
+	LastLogIndex int
+	LastLogTerm  int
 }
 
 type VoteReply struct {
 	Term    int
 	Granted bool
+}
+
+func (s *Server) uptoDate(index int, term int) bool {
+	if term != s.Term {
+		return term > s.Term
+	} else {
+		lastEntry := s.Log[len(s.Log)-1]
+		return index >= lastEntry.Index
+	}
 }
 
 func (s *Server) RequestVote(args *VoteArgs, reply *VoteReply) error {
@@ -250,12 +262,11 @@ func (s *Server) RequestVote(args *VoteArgs, reply *VoteReply) error {
 		reply.Granted = false
 	} else {
 		s.voting.Lock()
-		if s.VotedFor == nil || s.VotedFor.Id == args.Id {
+		if (s.VotedFor == nil || s.VotedFor.Id == args.Id) && s.uptoDate(args.LastLogIndex, args.LastLogTerm) {
 			s.Term = args.Term
 			s.VotedFor = &Vote{args.Id, time.Now()}
 			reply.Granted = true
 			reply.Term = s.Term
-
 		}
 		s.voting.Unlock()
 	}
