@@ -79,6 +79,8 @@ type Server struct {
 }
 
 func (s *Server) becomeLeader() {
+	log.Println("New leader:", s.host())
+
 	s.Role = Leader
 
 	for _, node := range s.Cluster {
@@ -89,6 +91,8 @@ func (s *Server) becomeLeader() {
 }
 
 func (s *Server) startElection() {
+	log.Println("New candidate:", s.host())
+
 	s.Role = Candidate
 	s.Term = 1
 	s.VotedFor = &Vote{s.Id, time.Now()}
@@ -271,6 +275,12 @@ func (s *Server) RequestVote(args *VoteArgs, reply *VoteReply) error {
 		s.voting.Unlock()
 	}
 
+	if reply.Granted {
+		log.Println("Vote granted:", s.host(), args.Id)
+	} else {
+		log.Println("Vote denied:", s.host(), args.Id)
+	}
+
 	return nil
 }
 
@@ -299,14 +309,16 @@ func (s *Server) logInconsistent(index int, term int) bool {
 
 func (s *Server) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) error {
 	if args.Term < s.Term {
+		log.Println("Invalid leader", s.host(), args.Id)
 		reply.Term = s.Term
 		reply.Success = false
 		reply.Error = TermOutdatedError
 	} else if s.logInconsistent(args.PrevLogIndex, args.PrevLogTerm) {
-		log.Println("Mismatch index/term")
+		log.Println("Log inconsistent", s.host(), args.Id)
 		reply.Success = false
 		reply.Error = LogInconsistentError
 	} else {
+		log.Println("Appending entries", s.host(), args.Id)
 		s.Term = args.Term
 		s.Leader = args.Id
 		s.Role = Follower
@@ -315,6 +327,8 @@ func (s *Server) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesRepl
 		if args.PrevLogIndex < len(s.Log) {
 			s.Log = s.Log[:args.PrevLogIndex+1]
 		}
+
+		// TODO: ignore log entries that are already present?
 
 		s.Log = append(s.Log, args.Entries...)
 		s.updateCommitIndex(args.LeaderCommit)
@@ -345,6 +359,7 @@ func (s *Server) Execute(args *ExecuteCommandArgs, reply *ExecuteCommandReply) e
 		return nil
 	}
 
+	log.Println("Executing command", s.host(), args.Command)
 	entry := LogEntry{len(s.Log), s.Term, args.Command}
 	s.Log = append(s.Log, entry)
 	safe := s.updateFollowers()
@@ -380,6 +395,8 @@ func NewServer(id string, clusterId string, clusterSize int) (s *Server) {
 
 	s.ElectionTimeout = time.Duration(ElectionTimeout + rand.Intn(ElectionTimeout))
 	s.configureCluster()
+
+	log.Println("Starting server", s.host())
 
 	go s.startHeartbeat()
 	go s.startRPC()
