@@ -17,15 +17,15 @@ func (c *Client) call(rpcname string, args interface{}, reply interface{}) bool 
 	return err == nil
 }
 
-func (c *Client) Execute(command Command) bool {
+func (c *Client) Execute(command Command) interface{} {
 	args := ExecuteCommandArgs{command}
 	reply := ExecuteCommandReply{}
 	ok := c.call("Server.Execute", &args, &reply)
 
 	if !ok || reply.Error == WrongServerError {
 		c.Primary = reply.Leader
-		ok = c.Execute(command)
+		ok = c.call("Server.Execute", &args, &reply)
 	}
 
-	return ok
+	return reply.Update
 }

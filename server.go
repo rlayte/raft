@@ -37,6 +37,9 @@ func call(srv string, rpcname string, args interface{}, reply interface{}) bool 
 }
 
 type Command struct {
+	Operation string
+	Key       string
+	Value     interface{}
 }
 
 type Vote struct {
@@ -45,9 +48,12 @@ type Vote struct {
 }
 
 type LogEntry struct {
+	Index   int
 	Term    int
 	Command Command
 }
+
+type CommitFunc func(Command) interface{}
 
 type Server struct {
 	Id              string
@@ -57,10 +63,13 @@ type Server struct {
 	Term            int
 	Log             []LogEntry
 	LastContact     time.Time
+	LastApplied     int
+	CommitIndex     int
 	Cluster         []Server
 	ClusterSize     int
 	VotedFor        *Vote
 	ElectionTimeout time.Duration
+	Commit          CommitFunc
 	voting          *sync.Mutex
 	dead            bool
 }
@@ -87,12 +96,21 @@ func (s *Server) startElection() {
 	}
 }
 
-func (s *Server) updateFollowers(entries []LogEntry) {
+func (s *Server) updateFollowers(entries []LogEntry) bool {
+	var failures int
+
 	for _, server := range s.Cluster {
-		args := AppendEntriesArgs{s.Term, s.host(), entries}
+		lastEntry := s.Log[len(s.Log)-1]
+		args := AppendEntriesArgs{s.Term, s.host(), entries, s.CommitIndex, lastEntry.Index, lastEntry.Term}
 		reply := AppendEntriesReply{}
-		call(server.host(), "Server.AppendEntries", &args, &reply)
+		ok := call(server.host(), "Server.AppendEntries", &args, &reply)
+
+		if !ok || !reply.Success {
+			failures++
+		}
 	}
+
+	return failures <= s.ClusterSize/2
 }
 
 func (s *Server) host() string {
@@ -114,6 +132,15 @@ func (s *Server) validCandidate() bool {
 func (s *Server) heartbeat() {
 	if s.Role == Leader {
 		s.updateFollowers([]LogEntry{})
+	}
+
+	for s.LastApplied < s.CommitIndex {
+		i := s.LastApplied + 1
+		if i > len(s.Log)-1 {
+		} else {
+			s.Commit(s.Log[i].Command)
+			s.LastApplied = s.Log[i].Index
+		}
 	}
 
 	if s.validCandidate() {
@@ -191,9 +218,12 @@ func (s *Server) RequestVote(args *VoteArgs, reply *VoteReply) error {
 }
 
 type AppendEntriesArgs struct {
-	Term    int
-	Id      string
-	Entries []LogEntry
+	Term         int
+	Id           string
+	Entries      []LogEntry
+	LeaderCommit int
+	PrevLogIndex int
+	PrevLogTerm  int
 }
 
 type AppendEntriesReply struct {
@@ -212,6 +242,15 @@ func (s *Server) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesRepl
 		s.LastContact = time.Now()
 		s.Log = append(s.Log, args.Entries...)
 
+		if args.LeaderCommit > s.CommitIndex {
+			lastEntry := s.Log[len(s.Log)-1]
+			if args.LeaderCommit < lastEntry.Index {
+				s.CommitIndex = args.LeaderCommit
+			} else {
+				s.CommitIndex = lastEntry.Index
+			}
+		}
+
 		reply.Term = s.Term
 		reply.Success = true
 	}
@@ -227,6 +266,7 @@ type ExecuteCommandReply struct {
 	Success bool
 	Error   RaftError
 	Leader  string
+	Update  interface{}
 }
 
 func (s *Server) Execute(args *ExecuteCommandArgs, reply *ExecuteCommandReply) error {
@@ -237,9 +277,15 @@ func (s *Server) Execute(args *ExecuteCommandArgs, reply *ExecuteCommandReply) e
 		return nil
 	}
 
-	entry := LogEntry{s.Term, args.Command}
+	entry := LogEntry{len(s.Log), s.Term, args.Command}
 	s.Log = append(s.Log, entry)
-	s.updateFollowers([]LogEntry{entry})
+	safe := s.updateFollowers([]LogEntry{entry})
+
+	if safe {
+		reply.Update = s.Commit(entry.Command)
+		s.LastApplied = entry.Index
+		s.CommitIndex = entry.Index
+	}
 
 	return nil
 }
@@ -250,11 +296,16 @@ func NewServer(id string, clusterId string, clusterSize int) (s *Server) {
 		ClusterId:   clusterId,
 		Role:        Follower,
 		Term:        0,
-		Log:         []LogEntry{},
+		Log:         []LogEntry{LogEntry{}},
 		Cluster:     []Server{},
 		LastContact: time.Now(),
 		ClusterSize: clusterSize,
 		voting:      &sync.Mutex{},
+	}
+
+	s.Commit = func(command Command) interface{} {
+		log.Println(s.host(), "Committing command to state machine", command)
+		return true
 	}
 
 	s.ElectionTimeout = time.Duration(ElectionTimeout + rand.Intn(ElectionTimeout))

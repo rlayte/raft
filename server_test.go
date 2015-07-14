@@ -6,18 +6,36 @@ import (
 	"time"
 )
 
-func createCluster(name string, n int) []*Server {
-	cluster := []*Server{}
+type KVStore struct {
+	*Server
+	data map[string]interface{}
+}
+
+func (s *KVStore) commit(command Command) interface{} {
+	switch command.Operation {
+	case "PUT":
+		s.data[command.Key] = command.Value
+	case "GET":
+		return s.data[command.Key]
+	}
+
+	return nil
+}
+
+func createCluster(name string, n int) []*KVStore {
+	cluster := []*KVStore{}
 
 	for i := 0; i < n; i++ {
 		id := fmt.Sprintf("%d", i)
-		cluster = append(cluster, NewServer(id, name, n))
+		store := &KVStore{NewServer(id, name, n), map[string]interface{}{}}
+		store.Commit = store.commit
+		cluster = append(cluster, store)
 	}
 
 	return cluster
 }
 
-func destroyCluster(cluster []*Server) {
+func destroyCluster(cluster []*KVStore) {
 	for _, server := range cluster {
 		server.kill()
 	}
@@ -46,7 +64,7 @@ func TestFirstElection(t *testing.T) {
 	cluster := createCluster("election", 5)
 	defer destroyCluster(cluster)
 
-	time.Sleep(time.Second)
+	time.Sleep(time.Duration(ElectionTimeout*2) * time.Millisecond)
 
 	leaders := 0
 	followers := 0
@@ -70,17 +88,17 @@ func TestFirstElection(t *testing.T) {
 	}
 }
 
-func TestAppendEntries(t *testing.T) {
+func TestLogReplication(t *testing.T) {
 	cluster := createCluster("append", 5)
 	defer destroyCluster(cluster)
 
-	time.Sleep(time.Second)
+	time.Sleep(time.Duration(ElectionTimeout*2) * time.Millisecond)
 
-	command := Command{}
+	command := Command{"PUT", "Foo", "Bar"}
 	client := Client{cluster[0].host()}
 	client.Execute(command)
 
-	time.Sleep(time.Second)
+	time.Sleep(time.Duration(HeartbeatInterval*2) * time.Millisecond)
 
 	for _, server := range cluster {
 		if len(server.Log) == 0 {
@@ -88,14 +106,40 @@ func TestAppendEntries(t *testing.T) {
 			continue
 		}
 
-		firstEntry := server.Log[0]
+		firstEntry := server.Log[1]
 
 		if firstEntry.Term != server.Term {
 			t.Error("Entry should share the same term as primary")
 		}
 
-		if firstEntry.Command != command {
+		if firstEntry.Command.Key != command.Key {
 			t.Error("First command should be appended")
+		}
+	}
+}
+
+func TestStateReplication(t *testing.T) {
+	cluster := createCluster("append", 5)
+	defer destroyCluster(cluster)
+
+	time.Sleep(time.Duration(ElectionTimeout*2) * time.Millisecond)
+
+	cases := map[string]string{
+		"Foo": "Bar",
+	}
+
+	client := Client{cluster[0].host()}
+
+	for k, v := range cases {
+		command := Command{"PUT", k, v}
+		client.Execute(command)
+
+		time.Sleep(time.Duration(HeartbeatInterval*2) * time.Millisecond)
+
+		for _, server := range cluster {
+			if server.data[k] != v {
+				t.Error(k, "should equal", v, server.data)
+			}
 		}
 	}
 }
