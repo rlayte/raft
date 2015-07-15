@@ -28,12 +28,18 @@ type RaftError string
 
 func call(srv string, rpcname string, args interface{}, reply interface{}) bool {
 	c, errx := rpc.Dial("unix", srv)
-	if errx != nil {
-		return false
+	for errx != nil {
+		time.Sleep(time.Duration(ElectionTimeout) * time.Millisecond)
+		c, errx = rpc.Dial("unix", srv)
 	}
 	defer c.Close()
 
 	err := c.Call(rpcname, args, reply)
+	for err != nil {
+		time.Sleep(time.Duration(HeartbeatInterval) * time.Millisecond)
+		err = c.Call(rpcname, args, reply)
+	}
+
 	return err == nil
 }
 
@@ -178,9 +184,11 @@ func (s *Server) validCandidate() bool {
 
 func (s *Server) heartbeat() {
 	if s.Role == Leader {
+		lastEntry := s.Log[len(s.Log)-1]
 		for _, server := range s.Cluster {
-			lastEntry := s.Log[len(s.Log)-1]
-			s.callAppendEntries(server, []LogEntry{}, lastEntry)
+			go func(server Server) {
+				s.callAppendEntries(server, []LogEntry{}, lastEntry)
+			}(server)
 		}
 	}
 
