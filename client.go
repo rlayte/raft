@@ -1,8 +1,13 @@
 package raft
 
-import "net/rpc"
+import (
+	"log"
+	"math/rand"
+	"net/rpc"
+)
 
 type Client struct {
+	cluster []*KVStore
 	Primary string
 }
 
@@ -22,10 +27,24 @@ func (c *Client) Execute(command Command) interface{} {
 	reply := ExecuteCommandReply{}
 	ok := c.call("Server.Execute", &args, &reply)
 
-	if !ok || reply.Error == WrongServerError {
+	if !ok {
+		newPrimary := c.cluster[rand.Intn(len(c.cluster))].host()
+		log.Println("Client error: changing primary", c.Primary, newPrimary)
+		c.Primary = newPrimary
+		ok = c.call("Server.Execute", &args, &reply)
+	}
+
+	if reply.Error == WrongServerError {
+		log.Println("Wrong primary:", c.Primary, reply.Leader)
 		c.Primary = reply.Leader
 		ok = c.call("Server.Execute", &args, &reply)
 	}
 
+	log.Println("Client executed", command, c.Primary)
+
 	return reply.Update
+}
+
+func NewClient(cluster []*KVStore) *Client {
+	return &Client{cluster, cluster[0].host()}
 }

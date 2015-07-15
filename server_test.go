@@ -95,7 +95,7 @@ func TestLogReplication(t *testing.T) {
 	time.Sleep(time.Duration(ElectionTimeout*2) * time.Millisecond)
 
 	command := Command{"PUT", "Foo", "Bar"}
-	client := Client{cluster[0].host()}
+	client := NewClient(cluster)
 	client.Execute(command)
 
 	time.Sleep(time.Duration(HeartbeatInterval*2) * time.Millisecond)
@@ -127,7 +127,7 @@ func checkStateMachine(t *testing.T, client *Client, cluster []*KVStore, cases m
 
 		for _, server := range cluster {
 			if server.data[k] != v {
-				t.Error(k, "should equal", v, "not", server.data[k], server.data)
+				t.Error(k, "should equal", v, "not", server.data[k], server.data, server.host())
 			}
 		}
 	}
@@ -139,19 +139,85 @@ func TestStateReplication(t *testing.T) {
 
 	time.Sleep(time.Duration(ElectionTimeout*2) * time.Millisecond)
 
-	client := Client{cluster[0].host()}
+	client := NewClient(cluster)
 
 	cases := map[string]string{
 		"Foo": "Bar",
 		"Bar": "Foo",
 	}
 
-	checkStateMachine(t, &client, cluster, cases)
+	checkStateMachine(t, client, cluster, cases)
 
 	updates := map[string]string{
 		"Foo": "Baz",
 		"Bar": "Baz",
 	}
 
-	checkStateMachine(t, &client, cluster, updates)
+	checkStateMachine(t, client, cluster, updates)
+}
+
+func TestFollowerCrash(t *testing.T) {
+	cluster := createCluster("replication", 5)
+	defer destroyCluster(cluster)
+
+	time.Sleep(time.Duration(ElectionTimeout*2) * time.Millisecond)
+
+	i := 0
+	follower := cluster[i]
+	for follower.Role != Follower {
+		i++
+		follower = cluster[i]
+	}
+
+	follower.kill()
+
+	client := NewClient(cluster)
+
+	cases := map[string]string{
+		"Foo": "Bar",
+		"Bar": "Foo",
+	}
+
+	time.Sleep(time.Duration(ElectionTimeout*2) * time.Millisecond)
+
+	follower.restart()
+	checkStateMachine(t, client, cluster, cases)
+}
+
+func findLeader(cluster []*KVStore) *KVStore {
+	i := 0
+	leader := cluster[i]
+	for leader.dead || leader.Role != Leader {
+		i++
+		leader = cluster[i]
+	}
+
+	return leader
+}
+
+func TestLeaderCrash(t *testing.T) {
+	cluster := createCluster("replication", 5)
+	defer destroyCluster(cluster)
+
+	time.Sleep(time.Duration(ElectionTimeout*2) * time.Millisecond)
+
+	leader := findLeader(cluster)
+	leader.kill()
+	time.Sleep(time.Duration(ElectionTimeout*2) * time.Millisecond)
+
+	newLeader := findLeader(cluster)
+
+	if newLeader.host() == leader.host() {
+		t.Error("A new leader should be elected", newLeader.host(), leader.host(), leader.dead)
+	}
+
+	client := NewClient(cluster)
+
+	cases := map[string]string{
+		"Foo": "Bar",
+		"Bar": "Foo",
+	}
+
+	leader.restart()
+	checkStateMachine(t, client, cluster, cases)
 }

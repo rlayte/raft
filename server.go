@@ -207,8 +207,10 @@ func (s *Server) heartbeat() {
 }
 
 func (s *Server) startHeartbeat() {
-	for !s.dead {
-		s.heartbeat()
+	for {
+		if !s.dead {
+			s.heartbeat()
+		}
 		time.Sleep(time.Millisecond * time.Duration(HeartbeatInterval))
 	}
 }
@@ -230,7 +232,9 @@ func (s *Server) startRPC() {
 			log.Println("Error", err)
 		}
 
-		go rpcs.ServeConn(conn)
+		if !s.dead {
+			go rpcs.ServeConn(conn)
+		}
 	}
 }
 
@@ -247,6 +251,10 @@ func (s *Server) updateCommitIndex(leaderCommit int) {
 
 func (s *Server) kill() {
 	s.dead = true
+}
+
+func (s *Server) restart() {
+	s.dead = false
 }
 
 func (s *Server) configureCluster() {
@@ -297,7 +305,7 @@ func (s *Server) RequestVote(args *VoteArgs, reply *VoteReply) error {
 	if reply.Granted {
 		log.Println("Vote granted:", s.host(), args.Id)
 	} else {
-		log.Println("Vote denied:", s.host(), args.Id)
+		log.Println("Vote denied:", s.host(), args.Id, s.VotedFor)
 	}
 
 	return nil
@@ -342,13 +350,12 @@ func (s *Server) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesRepl
 		s.Term = args.Term
 		s.Leader = args.Id
 		s.Role = Follower
+		s.VotedFor = nil
 		s.LastContact = time.Now()
 
 		if args.PrevLogIndex < len(s.Log) {
 			s.Log = s.Log[:args.PrevLogIndex+1]
 		}
-
-		// TODO: ignore log entries that are already present?
 
 		s.Log = append(s.Log, args.Entries...)
 		s.updateCommitIndex(args.LeaderCommit)
