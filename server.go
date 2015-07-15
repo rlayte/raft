@@ -7,7 +7,6 @@ import (
 	"net"
 	"net/rpc"
 	"os"
-	"sync"
 	"time"
 )
 
@@ -74,7 +73,6 @@ type Server struct {
 	VotedFor        *Vote
 	ElectionTimeout time.Duration
 	Commit          CommitFunc
-	voting          *sync.Mutex
 	dead            bool
 }
 
@@ -96,22 +94,35 @@ func (s *Server) startElection() {
 	s.Role = Candidate
 	s.Term = 1
 	s.VotedFor = &Vote{s.Id, time.Now()}
+	s.LastContact = time.Now()
 
-	votes := 1
+	votes := make(chan bool)
+	voteCount := 1
+
+	go func() {
+		for {
+			vote := <-votes
+
+			if vote {
+				voteCount++
+			}
+
+			if voteCount > s.ClusterSize/2 {
+				s.becomeLeader()
+				break
+			}
+		}
+	}()
+
 	lastEntry := s.Log[len(s.Log)-1]
 
 	for _, server := range s.Cluster {
-		args := VoteArgs{s.Term, s.Id, lastEntry.Index, lastEntry.Term}
-		reply := VoteReply{}
-		call(server.host(), "Server.RequestVote", &args, &reply)
-
-		if reply.Granted {
-			votes++
-		}
-	}
-
-	if votes > s.ClusterSize/2 {
-		s.becomeLeader()
+		go func(host string) {
+			args := VoteArgs{s.Term, s.Id, lastEntry.Index, lastEntry.Term}
+			reply := VoteReply{}
+			call(host, "Server.RequestVote", &args, &reply)
+			votes <- reply.Granted
+		}(server.host())
 	}
 }
 
@@ -122,29 +133,31 @@ func (s *Server) callAppendEntries(server Server, entries []LogEntry, prevEntry 
 	return ok, reply
 }
 
-func (s *Server) updateFollowers() bool {
-	var failures int
+func (s *Server) updateFollowers() chan bool {
+	updates := make(chan bool)
 
 	for _, server := range s.Cluster {
-		prevEntry := s.Log[s.NextIndex[server.host()]]
-		entries := s.Log[s.NextIndex[server.host()]:]
-		ok, reply := s.callAppendEntries(server, entries, prevEntry)
+		go func(server Server) {
+			prevEntry := s.Log[s.NextIndex[server.host()]]
+			entries := s.Log[s.NextIndex[server.host()]:]
+			ok, reply := s.callAppendEntries(server, entries, prevEntry)
 
-		for reply.Error == LogInconsistentError {
-			s.NextIndex[server.host()] -= 1
-			entries = s.Log[s.NextIndex[server.host()]:]
-			ok, reply = s.callAppendEntries(server, entries, prevEntry)
-		}
+			for reply.Error == LogInconsistentError {
+				log.Println("Fixing inconsistent log")
+				s.NextIndex[server.host()] -= 1
+				entries = s.Log[s.NextIndex[server.host()]:]
+				ok, reply = s.callAppendEntries(server, entries, prevEntry)
+			}
 
-		if !ok || !reply.Success {
-			failures++
-		} else {
-			lastEntry := s.Log[len(s.Log)-1]
-			s.NextIndex[server.host()] = lastEntry.Index + 1
-		}
+			if ok && reply.Success {
+				lastEntry := s.Log[len(s.Log)-1]
+				s.NextIndex[server.host()] = lastEntry.Index + 1
+				updates <- true
+			}
+		}(server)
 	}
 
-	return failures <= s.ClusterSize/2
+	return updates
 }
 
 func (s *Server) host() string {
@@ -252,10 +265,10 @@ type VoteReply struct {
 }
 
 func (s *Server) uptoDate(index int, term int) bool {
-	if term != s.Term {
-		return term > s.Term
+	lastEntry := s.Log[len(s.Log)-1]
+	if term != lastEntry.Term {
+		return term > lastEntry.Term
 	} else {
-		lastEntry := s.Log[len(s.Log)-1]
 		return index >= lastEntry.Index
 	}
 }
@@ -265,14 +278,12 @@ func (s *Server) RequestVote(args *VoteArgs, reply *VoteReply) error {
 		reply.Term = s.Term
 		reply.Granted = false
 	} else {
-		s.voting.Lock()
-		if (s.VotedFor == nil || s.VotedFor.Id == args.Id) && s.uptoDate(args.LastLogIndex, args.LastLogTerm) {
+		if s.VotedFor == nil && s.uptoDate(args.LastLogIndex, args.LastLogTerm) {
 			s.Term = args.Term
 			s.VotedFor = &Vote{args.Id, time.Now()}
 			reply.Granted = true
 			reply.Term = s.Term
 		}
-		s.voting.Unlock()
 	}
 
 	if reply.Granted {
@@ -315,10 +326,11 @@ func (s *Server) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesRepl
 		reply.Error = TermOutdatedError
 	} else if s.logInconsistent(args.PrevLogIndex, args.PrevLogTerm) {
 		log.Println("Log inconsistent", s.host(), args.Id)
+		s.LastContact = time.Now()
 		reply.Success = false
 		reply.Error = LogInconsistentError
 	} else {
-		log.Println("Appending entries", s.host(), args.Id)
+		log.Println("Appending entries", s.host(), args.Id, args.Entries)
 		s.Term = args.Term
 		s.Leader = args.Id
 		s.Role = Follower
@@ -360,14 +372,21 @@ func (s *Server) Execute(args *ExecuteCommandArgs, reply *ExecuteCommandReply) e
 	}
 
 	log.Println("Executing command", s.host(), args.Command)
+
 	entry := LogEntry{len(s.Log), s.Term, args.Command}
 	s.Log = append(s.Log, entry)
-	safe := s.updateFollowers()
+	updates := s.updateFollowers()
+	count := 1
 
-	if safe {
-		reply.Update = s.Commit(entry.Command)
-		s.LastApplied = entry.Index
-		s.CommitIndex = entry.Index
+	for {
+		<-updates
+		count++
+		if count > s.ClusterSize/2 {
+			reply.Update = s.Commit(entry.Command)
+			s.LastApplied = entry.Index
+			s.CommitIndex = entry.Index
+			break
+		}
 	}
 
 	return nil
@@ -385,18 +404,17 @@ func NewServer(id string, clusterId string, clusterSize int) (s *Server) {
 		MatchIndex:  map[string]int{},
 		LastContact: time.Now(),
 		ClusterSize: clusterSize,
-		voting:      &sync.Mutex{},
 	}
 
 	s.Commit = func(command Command) interface{} {
-		log.Println(s.host(), "Committing command to state machine", command)
 		return true
 	}
 
+	rand.Seed(time.Now().UnixNano())
 	s.ElectionTimeout = time.Duration(ElectionTimeout + rand.Intn(ElectionTimeout))
 	s.configureCluster()
 
-	log.Println("Starting server", s.host())
+	log.Println("Starting server", s.host(), s.ElectionTimeout)
 
 	go s.startHeartbeat()
 	go s.startRPC()
